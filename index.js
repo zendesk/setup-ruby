@@ -2,25 +2,43 @@ const os = require('os')
 const fs = require('fs')
 const path = require('path')
 const core = require('@actions/core')
-const exec = require('@actions/exec')
 const common = require('./common')
+const bundler = require('./bundler')
 
+const windows = common.windows
+
+const inputDefaults = {
+  'ruby-version': 'default',
+  'bundler': 'default',
+  'bundler-cache': 'true',
+  'working-directory': '.',
+}
+
+// entry point when this action is run on its own
 export async function run() {
   try {
-    await main()
+    await setupRuby()
   } catch (error) {
     core.setFailed(error.message)
   }
 }
 
-async function main() {
-  process.chdir(core.getInput('working-directory'))
+// entry point when this action is run from other actions
+export async function setupRuby(options = {}) {
+  const inputs = { ...options }
+  for (const key in inputDefaults) {
+    if (!Object.prototype.hasOwnProperty.call(inputs, key)) {
+      inputs[key] = core.getInput(key) || inputDefaults[key]
+    }
+  }
+
+  process.chdir(inputs['working-directory'])
 
   const platform = common.getVirtualEnvironmentName()
-  const [engine, parsedVersion] = parseRubyEngineAndVersion(core.getInput('ruby-version'))
+  const [engine, parsedVersion] = parseRubyEngineAndVersion(inputs['ruby-version'])
 
   let installer
-  if (platform === 'windows-latest' && engine !== 'jruby') {
+  if (platform.startsWith('windows-') && engine !== 'jruby') {
     installer = require('./windows')
   } else {
     installer = require('./ruby-builder')
@@ -30,14 +48,27 @@ async function main() {
   const version = validateRubyEngineAndVersion(platform, engineVersions, engine, parsedVersion)
 
   createGemRC()
+  envPreInstall()
 
-  const [rubyPrefix, newPathEntries] = await installer.install(platform, engine, version)
+  const rubyPrefix = await installer.install(platform, engine, version)
 
-  setupPath(newPathEntries)
+  // When setup-ruby is used by other actions, this allows code in them to run
+  // before 'bundle install'.  Installed dependencies may require additional
+  // libraries & headers, build tools, etc.
+  if (inputs['afterSetupPathHook'] instanceof Function) {
+    await inputs['afterSetupPathHook']({ platform, rubyPrefix, engine, version })
+  }
 
-  if (core.getInput('bundler') !== 'none') {
-    await common.measure('Installing Bundler', async () =>
-      installBundler(platform, rubyPrefix, engine, version))
+  if (inputs['bundler'] !== 'none') {
+    const [gemfile, lockFile] = bundler.detectGemfiles()
+
+    const bundlerVersion = await common.measure('Installing Bundler', async () =>
+        bundler.installBundler(inputs['bundler'], lockFile, platform, rubyPrefix, engine, version))
+
+    if (inputs['bundler-cache'] === 'true') {
+      await common.measure('bundle install', async () =>
+          bundler.bundleInstall(gemfile, lockFile, platform, engine, version, bundlerVersion))
+    }
   }
 
   core.setOutput('ruby-prefix', rubyPrefix)
@@ -60,7 +91,7 @@ function parseRubyEngineAndVersion(rubyVersion) {
   } else if (rubyVersion === '.tool-versions') { // Read from .tool-versions
     const toolVersions = fs.readFileSync('.tool-versions', 'utf8').trim()
     const rubyLine = toolVersions.split(/\r?\n/).filter(e => e.match(/^ruby\s/))[0]
-    rubyVersion = rubyLine.split(/\s+/, 2)[1]
+    rubyVersion = rubyLine.match(/^ruby\s+(.+)$/)[1]
     console.log(`Using ${rubyVersion} as input from file .tool-versions`)
   }
 
@@ -70,9 +101,9 @@ function parseRubyEngineAndVersion(rubyVersion) {
     version = rubyVersion
   } else if (!rubyVersion.includes('-')) { // myruby -> myruby-stableVersion
     engine = rubyVersion
-    version = '' // Let the logic below find the version
+    version = '' // Let the logic in validateRubyEngineAndVersion() find the version
   } else { // engine-X.Y.Z
-    [engine, version] = rubyVersion.split('-', 2)
+    [engine, version] = common.partition(rubyVersion, '-')
   }
 
   return [engine, version]
@@ -86,7 +117,13 @@ function validateRubyEngineAndVersion(platform, engineVersions, engine, parsedVe
   let version = parsedVersion
   if (!engineVersions.includes(parsedVersion)) {
     const latestToFirstVersion = engineVersions.slice().reverse()
-    const found = latestToFirstVersion.find(v => !common.isHeadVersion(v) && v.startsWith(parsedVersion))
+    // Try to match stable versions first, so an empty version (engine-only) matches the latest stable version
+    let found = latestToFirstVersion.find(v => common.isStableVersion(v) && v.startsWith(parsedVersion))
+    if (!found) {
+      // Exclude head versions, they must be exact matches
+      found = latestToFirstVersion.find(v => !common.isHeadVersion(v) && v.startsWith(parsedVersion))
+    }
+
     if (found) {
       version = found
     } else {
@@ -106,74 +143,17 @@ function createGemRC() {
   }
 }
 
-function setupPath(newPathEntries) {
-  const originalPath = process.env['PATH'].split(path.delimiter)
-  let cleanPath = originalPath.filter(entry => !/\bruby\b/i.test(entry))
-
-  if (cleanPath.length !== originalPath.length) {
-    core.startGroup('Cleaning PATH')
-    console.log('Entries removed from PATH to avoid conflicts with Ruby:')
-    for (const entry of originalPath) {
-      if (!cleanPath.includes(entry)) {
-        console.log(`  ${entry}`)
-      }
-    }
-    core.endGroup()
-  }
-
-  core.exportVariable('PATH', [...newPathEntries, ...cleanPath].join(path.delimiter))
-}
-
-function readBundledWithFromGemfileLock() {
-  if (fs.existsSync('Gemfile.lock')) {
-    const contents = fs.readFileSync('Gemfile.lock', 'utf8')
-    const lines = contents.split(/\r?\n/)
-    const bundledWithLine = lines.findIndex(line => /^BUNDLED WITH$/.test(line.trim()))
-    if (bundledWithLine !== -1) {
-      const nextLine = lines[bundledWithLine+1]
-      if (nextLine && /^\d+/.test(nextLine.trim())) {
-        const bundlerVersion = nextLine.trim()
-        const majorVersion = bundlerVersion.match(/^\d+/)[0]
-        console.log(`Using Bundler ${majorVersion} from Gemfile.lock BUNDLED WITH ${bundlerVersion}`)
-        return majorVersion
-      }
-    }
-  }
-  return null
-}
-
-async function installBundler(platform, rubyPrefix, engine, rubyVersion) {
-  var bundlerVersion = core.getInput('bundler')
-
-  if (bundlerVersion === 'default' || bundlerVersion === 'Gemfile.lock') {
-    bundlerVersion = readBundledWithFromGemfileLock()
-    if (!bundlerVersion) {
-      bundlerVersion = 'latest'
-    }
-  }
-
-  if (bundlerVersion === 'latest') {
-    bundlerVersion = '2'
-  }
-
-  if (rubyVersion.startsWith('2.2')) {
-    console.log('Bundler 2 requires Ruby 2.3+, using Bundler 1 on Ruby 2.2')
-    bundlerVersion = '1'
-  } else if (/^\d+/.test(bundlerVersion)) {
-    // OK
-  } else {
-    throw new Error(`Cannot parse bundler input: ${bundlerVersion}`)
-  }
-
-  if (engine === 'ruby' && common.isHeadVersion(rubyVersion) && bundlerVersion === '2') {
-    console.log(`Using Bundler 2 shipped with ${engine}-${rubyVersion}`)
-  } else if (engine === 'truffleruby' && bundlerVersion === '1') {
-    console.log(`Using Bundler 1 shipped with ${engine}`)
-  } else if (engine === 'rubinius') {
-    console.log(`Rubinius only supports the version of Bundler shipped with it`)
-  } else {
-    const gem = path.join(rubyPrefix, 'bin', 'gem')
-    await exec.exec(gem, ['install', 'bundler', '-v', `~> ${bundlerVersion}`, '--no-document'])
+// sets up ENV variables
+// currently only used on Windows runners
+function envPreInstall() {
+  const ENV = process.env
+  if (windows) {
+    // puts normal Ruby temp folder on SSD
+    core.exportVariable('TMPDIR', ENV['RUNNER_TEMP'])
+    // bash - sets home to match native windows, normally C:\Users\<user name>
+    core.exportVariable('HOME', ENV['HOMEDRIVE'] + ENV['HOMEPATH'])
+    // bash - needed to maintain Path from Windows
+    core.exportVariable('MSYS2_PATH_TYPE', 'inherit')
   }
 }
 

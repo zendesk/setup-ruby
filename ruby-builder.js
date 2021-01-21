@@ -6,27 +6,45 @@ const tc = require('@actions/tool-cache')
 const common = require('./common')
 const rubyBuilderVersions = require('./ruby-builder-versions')
 
-const builderReleaseTag = 'enable-shared'
+const builderReleaseTag = 'toolcache'
 const releasesURL = 'https://github.com/ruby/ruby-builder/releases'
+
+const windows = common.windows
 
 export function getAvailableVersions(platform, engine) {
   return rubyBuilderVersions.getVersions(platform)[engine]
 }
 
 export async function install(platform, engine, version) {
-  const rubyPrefix = await downloadAndExtract(platform, engine, version)
-  let newPathEntries
-  if (engine === 'rubinius') {
-    newPathEntries = [path.join(rubyPrefix, 'bin'), path.join(rubyPrefix, 'gems', 'bin')]
+  let rubyPrefix, inToolCache
+  if (common.shouldUseToolCache(engine, version)) {
+    inToolCache = tc.find('Ruby', version)
+    if (inToolCache) {
+      rubyPrefix = inToolCache
+    } else {
+      rubyPrefix = common.getToolCacheRubyPrefix(platform, version)
+    }
+  } else if (windows) {
+    rubyPrefix = path.join(`${common.drive}:`, `${engine}-${version}`)
   } else {
-    newPathEntries = [path.join(rubyPrefix, 'bin')]
+    rubyPrefix = path.join(os.homedir(), '.rubies', `${engine}-${version}`)
   }
-  return [rubyPrefix, newPathEntries]
+
+  // Set the PATH now, so the MSYS2 'tar' is in Path on Windows
+  common.setupPath([path.join(rubyPrefix, 'bin')])
+
+  if (!inToolCache) {
+    await downloadAndExtract(platform, engine, version, rubyPrefix);
+  }
+
+  return rubyPrefix
 }
 
-async function downloadAndExtract(platform, engine, version) {
-  const rubiesDir = path.join(os.homedir(), '.rubies')
-  await io.mkdirP(rubiesDir)
+async function downloadAndExtract(platform, engine, version, rubyPrefix) {
+  const parentDir = path.dirname(rubyPrefix)
+
+  await io.rmRF(rubyPrefix)
+  await io.mkdirP(parentDir)
 
   const downloadPath = await common.measure('Downloading Ruby', async () => {
     const url = getDownloadURL(platform, engine, version)
@@ -34,18 +52,32 @@ async function downloadAndExtract(platform, engine, version) {
     return await tc.downloadTool(url)
   })
 
-  const tar = platform.startsWith('windows') ? 'C:\\Windows\\system32\\tar.exe' : 'tar'
-  await common.measure('Extracting Ruby', async () =>
-    exec.exec(tar, [ '-xz', '-C', rubiesDir, '-f',  downloadPath ]))
+  await common.measure('Extracting Ruby', async () => {
+    if (windows) {
+      // Windows 2016 doesn't have system tar, use MSYS2's, it needs unix style paths
+      await exec.exec('tar', ['-xz', '-C', common.win2nix(parentDir), '-f', common.win2nix(downloadPath)])
+    } else {
+      await exec.exec('tar', ['-xz', '-C', parentDir, '-f', downloadPath])
+    }
+  })
 
-  return path.join(rubiesDir, `${engine}-${version}`)
+  if (common.shouldUseToolCache(engine, version)) {
+    common.createToolCacheCompleteFile(rubyPrefix)
+  }
 }
 
 function getDownloadURL(platform, engine, version) {
+  let builderPlatform = platform
+  if (platform.startsWith('windows-')) {
+    builderPlatform = 'windows-latest'
+  } else if (platform.startsWith('macos-')) {
+    builderPlatform = 'macos-latest'
+  }
+
   if (common.isHeadVersion(version)) {
-    return getLatestHeadBuildURL(platform, engine, version)
+    return getLatestHeadBuildURL(builderPlatform, engine, version)
   } else {
-    return `${releasesURL}/download/${builderReleaseTag}/${engine}-${version}-${platform}.tar.gz`
+    return `${releasesURL}/download/${builderReleaseTag}/${engine}-${version}-${builderPlatform}.tar.gz`
   }
 }
 
