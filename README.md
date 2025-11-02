@@ -1,7 +1,7 @@
 # setup-ruby
 
 This action downloads a prebuilt ruby and adds it to the `PATH`.
-
+https://github.com/zendesk/setup-ruby/blob/d5126b9b3579e429dd52e51e68624dda2e05be25/README.md#L4
 It is very efficient and takes about 5 seconds to download, extract and add the given Ruby to the `PATH`.
 No extra packages need to be installed.
 
